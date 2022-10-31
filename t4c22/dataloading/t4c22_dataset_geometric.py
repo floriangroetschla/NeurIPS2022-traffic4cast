@@ -23,6 +23,13 @@ from t4c22.t4c22_config import day_t_filter_weekdays_daytime_only
 from t4c22.t4c22_config import load_inputs
 
 
+from gnn_preprocessing import get_compacted_graph
+
+from t4c22.t4c22_config import load_road_graph
+from collections import defaultdict
+
+
+
 # https://pytorch-geometric.readthedocs.io/en/latest/notes/create_dataset.html#creating-larger-datasets
 class T4c22GeometricDataset(torch_geometric.data.Dataset):
     def __init__(
@@ -35,6 +42,7 @@ class T4c22GeometricDataset(torch_geometric.data.Dataset):
         limit: int = None,
         day_t_filter=day_t_filter_weekdays_daytime_only,
         competition: T4c22Competitions = T4c22Competitions.CORE,
+        compress = False
     ):
         """Dataset for t4c22 core competition (congestion classes) for one
         city.
@@ -74,6 +82,7 @@ class T4c22GeometricDataset(torch_geometric.data.Dataset):
         self.split = split
         self.city = city
         self.limit = limit
+        self.compress = compress
         self.day_t_filter = day_t_filter if split != "test" else None
         self.competition = competition
 
@@ -82,7 +91,8 @@ class T4c22GeometricDataset(torch_geometric.data.Dataset):
             edge_attributes=edge_attributes,
             root=root,
             df_filter=partial(day_t_filter_to_df_filter, filter=day_t_filter) if self.day_t_filter is not None else None,
-            skip_supersegments=self.competition == T4c22Competitions.CORE,
+            skip_supersegments=False
+            #skip_supersegments=self.competition == T4c22Competitions.CORE,
         )
 
         # `day_t: List[Tuple[Y-m-d-str,int_0_96]]`
@@ -92,6 +102,9 @@ class T4c22GeometricDataset(torch_geometric.data.Dataset):
             self.day_t = [("test", t) for t in range(num_tests)]
         else:
             self.day_t = [(day, t) for day in cc_dates(self.root, city=city, split=self.split) for t in range(4, 96) if self.day_t_filter(day, t)]
+
+
+        self.supergraph(root, city)
 
     def len(self) -> int:
         if self.limit is not None:
@@ -123,16 +136,17 @@ class T4c22GeometricDataset(torch_geometric.data.Dataset):
                 return data
 
         # x: 4 time steps of loop counters on nodes
-        x = self.torch_road_graph_mapping.load_inputs_day_t(basedir=basedir, city=city, split=split, day=day, t=t, idx=idx)
+        new_virtual = self.new_virtual
+        x = self.torch_road_graph_mapping.load_inputs_day_t(basedir=basedir, city=city, split=split, day=day, t=t, idx=idx, offset = new_virtual)
 
         # y: congestion classes on edges at +60'
-        y = None
+        y = torch.zeros(self.torch_road_graph_mapping.edge_index.shape[1])
+        y_eta = torch.zeros(self.num_supersegments)
         if self.split != "test":
             if self.competition == T4c22Competitions.CORE:
                 y = self.torch_road_graph_mapping.load_cc_labels_day_t(basedir=basedir, city=city, split=split, day=day, t=t, idx=idx)
-            else:
-                y = self.torch_road_graph_mapping.load_eta_labels_day_t(basedir=basedir, city=city, split=split, day=day, t=t, idx=idx)
-
+                y_eta = self.torch_road_graph_mapping.load_eta_labels_day_t(basedir=basedir, city=city, split=split, day=day, t=t, idx=idx)
+            
         # https://pytorch-geometric.readthedocs.io/en/latest/modules/data.html:
         #         x (Tensor, optional) – Node feature matrix with shape [num_nodes, num_node_features]. (default: None)
         #         edge_index (LongTensor, optional) – Graph connectivity in COO format with shape [2, num_edges]. (default: None)
@@ -142,6 +156,18 @@ class T4c22GeometricDataset(torch_geometric.data.Dataset):
         #         **kwargs (optional) – Additional attributes.
 
         data = torch_geometric.data.Data(x=x, edge_index=self.torch_road_graph_mapping.edge_index, y=y, edge_attr=self.torch_road_graph_mapping.edge_attr)
+
+        data.y_eta = y_eta
+
+        data.edge_index_supergraph = self.edge_index_supergraph
+        data.edge_index_to_super   = self.edge_index_to_super
+        data.edge_index_linegraph  = self.edge_index_linegraph
+
+
+
+        if self.compress:
+            data = get_compacted_graph(data)
+
         # x.size(): (num_nodes, 4) - loop counter data, a lot of NaNs!
         # y.size(): (num_edges, 1) - congestion classification data, contains NaNs.
 
@@ -150,3 +176,54 @@ class T4c22GeometricDataset(torch_geometric.data.Dataset):
             torch.save(data, cache_file)
 
         return data
+
+    def to_edge_index(self,edges):
+        return torch.tensor(
+            [[n for n, _ in edges], [n for _, n in edges]], dtype=torch.long
+        )
+
+    def supergraph(self, root = None, city = "london"):
+        df_edges, df_nodes, df_supersegments = load_road_graph(root, city, skip_supersegments=False)
+
+        noncounter_nodes = [r["node_id"] for r in df_nodes.to_dict("records") if r["counter_info"] == ""]
+        counter_nodes = [r["node_id"] for r in df_nodes.to_dict("records") if r["counter_info"] != ""]
+        nodes =  counter_nodes +  noncounter_nodes
+
+
+        node_to_int_mapping = defaultdict(lambda: -1)
+        for i, k in enumerate( nodes):
+            node_to_int_mapping[k] = i
+        nodes_offset = len(nodes)
+        supersegments = [[int(x) for x in r["identifier"].split(",")] for r in df_supersegments.to_dict("records")]
+
+
+        #my enumeration for this
+        edges = [(seg[0], seg[1]) for seg in supersegments]
+        superedges_offset = len(edges)
+        super_edge_to_id = {u:i for i, u in enumerate(edges)}
+
+
+        #OG supergraph
+        edges_supergraph = [(node_to_int_mapping[u], node_to_int_mapping[v]) for u,v in edges]
+        edges_supergraph = edges_supergraph + [(v,u) for u,v in edges_supergraph]
+        self.edge_index_supergraph = self.to_edge_index(edges_supergraph)
+
+        #OG -> super line graph
+        edges_to_super = [(node_to_int_mapping[node],super_edge_to_id[(r["nodes"][0], r["nodes"][-1])]+nodes_offset)
+                        for r in df_supersegments.to_dict("records") for node in r["nodes"]]
+        self.edge_index_to_super = self.to_edge_index(edges_to_super)
+
+        #list of all supernodes
+        set_of_supernodes = sorted(list(set([node for edge in edges for node in edge])))
+        num_supernodes = len(set_of_supernodes)
+        to_supernode = {node: i for i,node in enumerate(set_of_supernodes)}
+
+        directed_linegraph = [(nodes_offset + super_edge_to_id[edge],
+                                nodes_offset + superedges_offset+to_supernode[node])
+                                for edge in edges for node in edge]
+        linegraph_edges = directed_linegraph + [(v,u) for u,v in directed_linegraph]
+        self.edge_index_linegraph = self.to_edge_index(linegraph_edges)
+        self.new_virtual = superedges_offset + num_supernodes
+        self.num_supersegments = superedges_offset
+
+

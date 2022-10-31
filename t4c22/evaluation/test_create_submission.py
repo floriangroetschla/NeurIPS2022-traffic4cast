@@ -204,9 +204,34 @@ def apply_model_plain(data, device, model):
     return model(x)
 
 
-def apply_model_geometric(data, device, model):
+from t4c22.gnn_code.gnn_utils import normalize_ft
+
+@torch.no_grad()
+def apply_model_geometric(data, device, model, use_original=True):
+    model.eval()
+    data = normalize_ft(data)
+
     data = data.to(device)
-    y_hat = model(data)
+
+    data.x = data.x.nan_to_num(-1)
+    data.edge_attr = data.edge_attr.nan_to_num(-1)
+
+    result = model(data)
+    if type(result) is tuple:
+        y_hat = result[1]
+    else:
+        y_hat = result
+
+    #if use_original:
+    #    ll = data.y_orig.shape[0]
+    #    #ll = data.edge_index_index.shape[0]
+    #    y_hat_orig = torch.zeros((ll, 3))
+    #    for i in range(y_hat_orig.shape[0]):
+    #        y_hat_orig[i] = y_hat[data.edge_index_index[i]]
+    #    y_hat = y_hat_orig.to(device)
+
+
+
     return y_hat
 
 

@@ -13,12 +13,19 @@ from collections import defaultdict
 from pathlib import Path
 
 import pandas as pd
+pd.options.mode.chained_assignment = None  # default='warn'
+
+import json
 import torch
 
 from t4c22.t4c22_config import load_cc_labels
 from t4c22.t4c22_config import load_eta_labels
 from t4c22.t4c22_config import load_inputs
 from t4c22.t4c22_config import load_road_graph
+
+import pyarrow.parquet as pq
+
+import ast
 
 
 class TorchRoadGraphMapping:
@@ -73,11 +80,27 @@ class TorchRoadGraphMapping:
         self.edge_attributes = edge_attributes
         self.edge_attr = None
         if edge_attributes is not None:
-            self.edge_attr = torch.full(size=(len(self.edges), len(self.edge_attributes)), fill_value=float("nan"), dtype=torch.float64)
+            self.edge_attr = torch.full(size=(len(self.edges), len(self.edge_attributes)), fill_value=float("nan"))#, dtype=torch.float64)
             assert len(self.edges) == len(self.edge_records)
             for i, edge in enumerate(self.edge_records):
                 for j, attr in enumerate(edge_attributes):
-                    self.edge_attr[i, j] = edge[attr]
+                    #print(edge[attr])
+                    if attr == "lanes":
+                        if edge[attr] == "":
+                            continue
+                        elif ';' in edge[attr]:
+                            continue
+                            xx = edge[attr].split(';')
+                            print(edge[attr])
+                            edge[attr] = sum([float(x) for x in xx])/len(xx)
+                            self.edge_attr[i,j] = float(edge[attr])
+                            
+                        elif edge[attr][0]=='[':
+                            xx = ast.literal_eval(edge[attr])
+                            edge[attr] = sum([float(x) for x in xx])/len(xx)
+                            self.edge_attr[i,j] = float(edge[attr])
+                    else:
+                        self.edge_attr[i, j] = edge[attr]#torch.tensor(edge[attr])#torch.from_numpy(edge[attr]).float().to(device) #edge[attr]
 
         # supersegments
         # `ExternalSupersegmentId = int64 (the generated ids)`
@@ -93,7 +116,7 @@ class TorchRoadGraphMapping:
             self.supersegments_d = {r["identifier"]: i for i, r in enumerate(df_supersegments.to_dict("records"))}
             self.supersegment_to_edges_mapping = [[(u, v) for u, v in zip(r["nodes"], r["nodes"][1:])] for r in df_supersegments.to_dict("records")]
 
-    def load_inputs_day_t(self, basedir: Path, city: str, split: str, day: str, t: int, idx: int) -> torch.Tensor:
+    def load_inputs_day_t(self, basedir: Path, city: str, split: str, day: str, t: int, idx: int, offset:int) -> torch.Tensor:
         """Used by dataset getter to load input data (sparse loop counter data
         on nodes) from parquet into tensor.
 
@@ -119,20 +142,37 @@ class TorchRoadGraphMapping:
         df_x["slot"] = df_x.index % 4
         df_x["volumes_1h"] = df_x["volumes_1h"].astype("float")
 
-        x = torch.full(size=(len(self.counter_nodes) if self.counters_only else len(self.node_to_int_mapping), 4), fill_value=float("nan"))
-
+        x = torch.full(size=(len(self.counter_nodes) if self.counters_only else len(self.node_to_int_mapping)+offset, 6), fill_value=float("nan"))
+        
+        fn2 = basedir / "road_graph" / city / "road_graph_nodes.parquet"
+        df2 = pq.read_table(fn2).to_pandas()
+        df2["node_id"] = df2["node_id"].astype("int64")
+        df2["x"] = df2["x"].astype("float")
+        df2["y"] = df2["y"].astype("float")
+        df2 = df2[['node_id', 'x', 'y']]
+        df3 = df2[['x','y']]
+        df2[['x','y']]=(df3-df3.min())/(df3.max()-df3.min())
+        
+        
         # (Mis-)use (day,t) for dataloading test sets where we do not exhibit day,t
         if day == "test":
             data = df_x[(df_x["test_idx"] == idx)].copy()
         else:
             data = df_x[(df_x["day"] == day) & (df_x["t"] == t)].copy()
 
+
+        #data = data.merge(df2[['node_id', 'x', 'y']],on="node_id")
+
         data["node_index"] = [self.node_to_int_mapping[x] for x in data["node_id"]]
+        df2["node_index_full"] = [self.node_to_int_mapping[x] for x in df2["node_id"]]
 
         # sanity check as defaultdict returns -1 for non-existing node_ids
         assert len(data[data["node_index"] < 0]) == 0
 
         x[data["node_index"].values, data["slot"].values] = torch.tensor(data["volumes_1h"].values).float()
+        x[df2["node_index_full"].values, 4] = torch.tensor(df2["x"].values).float()
+        x[df2["node_index_full"].values, 5] = torch.tensor(df2["y"].values).float()
+
         return x
 
     def load_cc_labels_day_t(self, basedir: Path, city: str, split: str, day: str, t: int, idx: int) -> torch.Tensor:
