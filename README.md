@@ -62,9 +62,12 @@ Models are stored in `models` after every epoch and can be used for the submissi
 ## Cite
 To cite our work:
 
-```
-@InProceedings{to be announced,
+```latex
+@article{HierarchicalTrafficGNN2022,
+  title = {Hierarchical Graph Structures for Congestion and ETA Prediction},
+  author = {Grötschla, Florian and Mathys, Joël},
+  url = {https://arxiv.org/abs/2211.11762},
+  publisher = {arXiv},
+  year={2022}
 }
-
 ```
-
